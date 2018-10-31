@@ -166,6 +166,12 @@ flags.DEFINE_string('train_split', 'train',
 
 flags.DEFINE_string('dataset_dir', None, 'Where the dataset reside.')
 
+# edge loss
+flags.DEFINE_multi_string('edge_loss_filters', [], 'Edge Loss: Filters to include in the side branch') # 'laplace'
+flags.DEFINE_string('edge_loss_norm', 'l2', 'Edge Loss: Norm to calculate the final loss')
+flags.DEFINE_boolean('edge_loss_smoothing', False, 'Edge Loss: Smooth groundtruth before calculating the loss')
+# flags.DEFINE_string('edge-loss-', None, 'Edge Loss: ')
+
 
 def _build_deeplab(inputs_queue, outputs_to_num_classes, ignore_label):
   """Builds a clone of DeepLab.
@@ -212,6 +218,8 @@ def _build_deeplab(inputs_queue, outputs_to_num_classes, ignore_label):
       output_type_dict[model.MERGED_LOGITS_SCOPE],
       name=common.OUTPUT_TYPE)
 
+  # add losses
+  # cross entropy
   for output, num_classes in six.iteritems(outputs_to_num_classes):
     train_utils.add_softmax_cross_entropy_loss_for_each_scale(
         outputs_to_scales_to_logits[output],
@@ -221,6 +229,22 @@ def _build_deeplab(inputs_queue, outputs_to_num_classes, ignore_label):
         loss_weight=1.0,
         upsample_logits=FLAGS.upsample_logits,
         scope=output)
+
+  # edge loss
+  print("FLAGS.edge_loss_filters", FLAGS.edge_loss_filters)
+  if len(FLAGS.edge_loss_filters) > 0:
+    for output, num_classes in six.iteritems(outputs_to_num_classes):
+      train_utils.add_edge_loss_for_each_scale(
+        outputs_to_scales_to_logits[output],
+        samples[common.LABEL],
+        num_classes,
+        ignore_label,
+        loss_weight=1.0,
+        upsample_logits=FLAGS.upsample_logits,
+        scope=output,
+        edge_filters=FLAGS.edge_loss_filters,
+        norm=FLAGS.edge_loss_norm,
+        smoothing=FLAGS.edge_loss_smoothing)
 
   return outputs_to_scales_to_logits
 
