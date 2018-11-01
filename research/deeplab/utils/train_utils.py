@@ -18,9 +18,161 @@ import six
 
 import tensorflow as tf
 from deeplab.core import preprocess_utils
-
 slim = tf.contrib.slim
 
+def add_edge_loss_for_each_scale(scales_to_logits,
+                                labels,
+                                num_classes,
+                                ignore_label,
+                                loss_weight=1.0,
+                                upsample_logits=True,
+                                scope=None,
+                                edge_filters=[],
+                                norm='l2',
+                                smoothing=False):
+  """Adds edge loss for logits of each scale.
+
+  Args:
+    scales_to_logits: A map from logits names for different scales to logits.
+      The logits have shape [batch, logits_height, logits_width, num_classes].
+    labels: Groundtruth labels with shape [batch, image_height, image_width, 1].
+    num_classes: Integer, number of target classes.
+    ignore_label: Integer, label to ignore.
+    loss_weight: Float, loss weight.
+    upsample_logits: Boolean, upsample logits or not.
+    scope: String, the scope for the loss.
+
+  Raises:
+    ValueError: Label or logits is None.
+  """
+  if labels is None:
+    raise ValueError('No label for softmax cross entropy loss.')
+
+  print("edge_filters", edge_filters)
+  print("scales_to_logits")
+  print("scope", scope)
+  for scale, logits in six.iteritems(scales_to_logits):
+    loss_scope = None
+    if scope:
+      loss_scope = 'edge_loss_%s_%s' % (scope, scale)
+      print("loss_scope", loss_scope)
+
+    if upsample_logits:
+      # Label is not downsampled, and instead we upsample logits.
+      logits = tf.image.resize_bilinear(
+          logits,
+          preprocess_utils.resolve_shape(labels, 4)[1:3],
+          align_corners=True)
+      scaled_labels = labels
+    else:
+      # Label is downsampled to the same size as logits.
+      scaled_labels = tf.image.resize_nearest_neighbor(
+          labels,
+          preprocess_utils.resolve_shape(logits, 4)[1:3],
+          align_corners=True)
+
+    y_pred = tf.sigmoid(logits)
+    not_ignore_mask = tf.to_float(tf.not_equal(scaled_labels,
+                                               ignore_label)) * loss_weight
+    
+    scaled_labels = tf.reshape(scaled_labels, shape=[-1])
+    one_hot_labels = slim.one_hot_encoding(
+        scaled_labels, num_classes, on_value=1.0, off_value=0.0)
+    
+    y_true = tf.reshape(one_hot_labels, y_pred.shape)
+    relevant_mask = tf.to_float(tf.not_equal(one_hot_labels, 0))
+    relevant_mask = tf.reshape(relevant_mask, y_pred.shape)
+
+    weights = relevant_mask * not_ignore_mask
+    
+    sobel_x_kernel = tf.reshape(tf.constant([[1, 2, 1],
+                                            [0, 0, 0],
+                                            [-1, -2, -1]], dtype=tf.float32),
+                                shape=[3, 3, 1, 1], name='sobel_x_kernel')
+    sobel_y_kernel = tf.reshape(tf.constant([[1, 0, -1],
+                                            [2, 0, -2],
+                                            [1, 0, -1]], dtype=tf.float32),
+                                shape=[3, 3, 1, 1], name='sobel_y_kernel')
+    # laplace kernel
+    laplacian_kernel = tf.reshape(tf.constant([[1, 1, 1],
+                                              [1, -8, 1],
+                                              [1, 1, 1]], dtype=tf.float32),
+                                  shape=[3, 3, 1, 1], name='laplacian_kernel')
+
+    gaussian_kernel = tf.reshape(tf.constant([[0.077847, 0.123317, 0.077847],
+                                              [0.123317, 0.195346, 0.1233179],
+                                              [0.077847, 0.123317, 0.077847]], dtype=tf.float32),
+                                shape=[3, 3, 1, 1], name='gaussian_kernel')
+
+    filter_map = {
+        "sobel-x": sobel_x_kernel,
+        "sobel-y": sobel_y_kernel,
+        "laplace": laplacian_kernel
+    }
+
+    lp_norm_map = {
+        "l1": 1,
+        "l2": 2,
+        "l3": 3,
+        "l4": 4,
+        "l5": 5
+    }
+
+    if norm not in lp_norm_map:
+        raise ValueError("The `norm` '{0}' is not supported. Supported values are: [l1...l5]".format(norm))
+
+    edge_filters = tf.concat([filter_map[x] for x in edge_filters], axis=-1)
+
+    def conv_single_channel(x):
+      x = tf.expand_dims(x, -1)
+
+      conv = tf.nn.conv2d(input=x, filter=edge_filters, strides=[1, 1, 1, 1], padding='SAME')
+
+      conv = tf.squeeze(conv, -1)
+
+      return conv
+    y_pred_edges = tf.transpose(
+      tf.map_fn(conv_single_channel, tf.transpose(y_pred, (3, 0, 1, 2))),
+      (1, 2, 3, 0)
+    )
+
+    if smoothing:
+        # First filter with gaussian to smooth edges of groundtruth
+        y_true = tf.nn.conv2d(input=y_true, filter=gaussian_kernel, strides=[1, 1, 1, 1], padding='SAME')
+    y_true_edges = tf.transpose(
+      tf.map_fn(conv_single_channel, tf.transpose(y_true, (3, 0, 1, 2))),
+      (1, 2, 3, 0)
+    )
+
+    def append_magnitude(edges, name=None):
+        magnitude = tf.expand_dims(tf.sqrt(edges[:, :, :, 0] ** 2 + edges[:, :, :, 1] ** 2), axis=-1)
+        return tf.concat([edges, magnitude], axis=-1, name=name)
+
+    def lp_loss(y_true, y_pred, p):
+        return tf.pow(tf.abs(y_pred - y_true), p)
+
+    def smoothness_loss(y_true, y_pred, p):
+        weight_smoothness = tf.exp(tf.negative(tf.abs(y_true)))
+        smoothness = y_pred * weight_smoothness
+        smoothness = smoothness[:, :, :, 0] + smoothness[:, :, :, 1]
+        return tf.reduce_mean(tf.pow(tf.abs(smoothness), p))
+
+    weights = not_ignore_mask*relevant_mask
+    print("weights", weights.shape)
+    with tf.name_scope(loss_scope, "mean_squared_error",
+                      (y_pred_edges, y_true_edges, weights)) as scope:
+      # calculate the edge agreement loss per pixel
+      pixel_wise_edge_loss = lp_loss(y_true=y_true_edges, y_pred=y_pred_edges, p=lp_norm_map[norm])
+      print("pixel_wise_edge_loss", pixel_wise_edge_loss.shape)
+      error = tf.losses.compute_weighted_loss(
+        pixel_wise_edge_loss,
+        weights=weights,
+        scope=scope,
+        loss_collection=tf.GraphKeys.LOSSES,
+        reduction=tf.losses.Reduction.SUM_BY_NONZERO_WEIGHTS
+        )
+
+      return error
 
 def add_softmax_cross_entropy_loss_for_each_scale(scales_to_logits,
                                                   labels,
